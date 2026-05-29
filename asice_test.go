@@ -403,3 +403,241 @@ func TestSafePath(t *testing.T) {
 		}
 	}
 }
+
+// --- ExtractSignatures / AddDocuments (fileless containers) ------------------
+
+// makeFileless strips the data objects from a complete container, producing a
+// fileless one as if the signing service never had the file bytes.
+func makeFileless(t *testing.T, full []byte) []byte {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(full), int64(len(full)))
+	if err != nil {
+		t.Fatalf("makeFileless: open zip: %v", err)
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range zr.File {
+		if isDataObject(f.Name) {
+			continue
+		}
+		if err := copyRaw(zw, f); err != nil {
+			t.Fatalf("makeFileless: copy %q: %v", f.Name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("makeFileless: close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestAddDocuments_Complete(t *testing.T) {
+	docs := sampleDocs()
+	sig := File{Name: "xades.xml", Data: makeXAdES(t, docs, xadesOpts{})}
+	full, err := BuildContainer(docs, []File{sig}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer: %v", err)
+	}
+	fileless := makeFileless(t, full)
+
+	completed, err := AddDocuments(fileless, docs)
+	if err != nil {
+		t.Fatalf("AddDocuments: %v", err)
+	}
+
+	// Data objects are present and byte-identical to the originals.
+	for _, doc := range docs {
+		got, _ := readZipEntry(t, completed, doc.Name)
+		if !bytes.Equal(got, doc.Data) {
+			t.Fatalf("%q content differs after AddDocuments", doc.Name)
+		}
+	}
+
+	// Container parses correctly with the right counts.
+	_, sigs, objs, err := Inspect(completed)
+	if err != nil {
+		t.Fatalf("Inspect completed: %v", err)
+	}
+	if len(sigs) != 1 {
+		t.Fatalf("signatures = %d, want 1", len(sigs))
+	}
+	if len(objs) != 2 {
+		t.Fatalf("data objects = %d, want 2", len(objs))
+	}
+}
+
+func TestAddDocuments_Errors(t *testing.T) {
+	docs := sampleDocs()
+	sig := File{Name: "xades.xml", Data: makeXAdES(t, docs, xadesOpts{})}
+	full, err := BuildContainer(docs, []File{sig}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer: %v", err)
+	}
+	fileless := makeFileless(t, full)
+
+	t.Run("wrong digest", func(t *testing.T) {
+		badDoc := File{Name: docs[0].Name, Data: []byte("tampered content")}
+		_, err := AddDocuments(fileless, []File{badDoc, docs[1]})
+		if !errors.Is(err, ErrDigestMismatch) {
+			t.Fatalf("want ErrDigestMismatch, got %v", err)
+		}
+	})
+
+	t.Run("wrong name", func(t *testing.T) {
+		wrongName := File{Name: "other.txt", Data: docs[0].Data}
+		_, err := AddDocuments(fileless, []File{wrongName, docs[1]})
+		if !errors.Is(err, ErrFilenameMismatch) {
+			t.Fatalf("want ErrFilenameMismatch, got %v", err)
+		}
+	})
+
+	t.Run("incomplete — one doc missing", func(t *testing.T) {
+		// Provide only one of the two referenced documents.
+		_, err := AddDocuments(fileless, docs[:1])
+		if !errors.Is(err, ErrFilenameMismatch) {
+			t.Fatalf("want ErrFilenameMismatch (incomplete), got %v", err)
+		}
+	})
+
+	t.Run("no signatures", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		writeMimetype(zw)
+		zw.Close()
+		_, err := AddDocuments(buf.Bytes(), docs)
+		if !errors.Is(err, ErrNoSignatures) {
+			t.Fatalf("want ErrNoSignatures, got %v", err)
+		}
+	})
+}
+
+func TestExtractSignatures_Basic(t *testing.T) {
+	docs := sampleDocs()
+	sig := File{Name: "xades.xml", Data: makeXAdES(t, docs, xadesOpts{})}
+	full, err := BuildContainer(docs, []File{sig}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer: %v", err)
+	}
+	fileless := makeFileless(t, full)
+
+	extracted, err := ExtractSignatures(fileless)
+	if err != nil {
+		t.Fatalf("ExtractSignatures: %v", err)
+	}
+	if len(extracted) != 1 {
+		t.Fatalf("extracted %d signatures, want 1", len(extracted))
+	}
+	if extracted[0].Name != "META-INF/signatures0.xml" {
+		t.Fatalf("Name = %q, want META-INF/signatures0.xml", extracted[0].Name)
+	}
+}
+
+func TestExtractSignatures_NoSignatures(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	writeMimetype(zw)
+	zw.Close()
+	_, err := ExtractSignatures(buf.Bytes())
+	if !errors.Is(err, ErrNoSignatures) {
+		t.Fatalf("want ErrNoSignatures, got %v", err)
+	}
+}
+
+func TestExtractSignatures_InvalidContainer(t *testing.T) {
+	_, err := ExtractSignatures([]byte("not a zip"))
+	if !errors.Is(err, ErrInvalidContainer) {
+		t.Fatalf("want ErrInvalidContainer, got %v", err)
+	}
+}
+
+func TestExtractAndMerge(t *testing.T) {
+	docs := sampleDocs()
+
+	// First party: build a complete container.
+	target, err := BuildContainer(docs, []File{{Name: "first.xml", Data: makeXAdES(t, docs, xadesOpts{id: "FIRST"})}}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer target: %v", err)
+	}
+
+	// Second party: co-signs the same docs; signing service produces a fileless container.
+	secondFull, err := BuildContainer(docs, []File{{Name: "second.xml", Data: makeXAdES(t, docs, xadesOpts{id: "SECOND"})}}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer second: %v", err)
+	}
+	fileless := makeFileless(t, secondFull)
+
+	// Extract the co-signature and merge it into the target.
+	extracted, err := ExtractSignatures(fileless)
+	if err != nil {
+		t.Fatalf("ExtractSignatures: %v", err)
+	}
+	merged, err := AddSignature(target, extracted[0].Data)
+	if err != nil {
+		t.Fatalf("AddSignature: %v", err)
+	}
+
+	_, sigs, _, err := Inspect(merged)
+	if err != nil {
+		t.Fatalf("Inspect merged: %v", err)
+	}
+	if len(sigs) != 2 {
+		t.Fatalf("merged signatures = %d, want 2", len(sigs))
+	}
+}
+
+func TestExtractAndMerge_TargetMismatch(t *testing.T) {
+	docs := sampleDocs()
+	target, err := BuildContainer(docs, []File{{Name: "sig.xml", Data: makeXAdES(t, docs, xadesOpts{})}}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer: %v", err)
+	}
+
+	// A second party that signed a different set of docs — name differs.
+	otherDocs := []File{
+		{Name: "doc1.txt", Data: []byte("hello world")},
+		{Name: "extra.txt", Data: []byte("extra file content")},
+	}
+	secondFull, err := BuildContainer(otherDocs, []File{{Name: "sig2.xml", Data: makeXAdES(t, otherDocs, xadesOpts{})}}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer otherDocs: %v", err)
+	}
+	fileless := makeFileless(t, secondFull)
+
+	extracted, err := ExtractSignatures(fileless)
+	if err != nil {
+		t.Fatalf("ExtractSignatures: %v", err)
+	}
+	if _, err := AddSignature(target, extracted[0].Data); !errors.Is(err, ErrSignatureTargetMismatch) {
+		t.Fatalf("want ErrSignatureTargetMismatch, got %v", err)
+	}
+}
+
+func TestAddDocuments_RoundTrip(t *testing.T) {
+	docs := sampleDocs()
+	sig := File{Name: "xades.xml", Data: makeXAdES(t, docs, xadesOpts{})}
+	original, err := BuildContainer(docs, []File{sig}, nil)
+	if err != nil {
+		t.Fatalf("BuildContainer: %v", err)
+	}
+
+	origSig0, _ := readZipEntry(t, original, "META-INF/signatures0.xml")
+
+	fileless := makeFileless(t, original)
+	completed, err := AddDocuments(fileless, docs)
+	if err != nil {
+		t.Fatalf("AddDocuments: %v", err)
+	}
+
+	// Data objects match the originals byte-for-byte.
+	for _, doc := range docs {
+		got, _ := readZipEntry(t, completed, doc.Name)
+		if !bytes.Equal(got, doc.Data) {
+			t.Fatalf("round-trip: %q content differs", doc.Name)
+		}
+	}
+
+	// Signature is byte-for-byte unchanged (so it remains valid).
+	newSig0, _ := readZipEntry(t, completed, "META-INF/signatures0.xml")
+	if !bytes.Equal(origSig0, newSig0) {
+		t.Fatalf("round-trip: signatures0.xml was modified by AddDocuments")
+	}
+}
