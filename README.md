@@ -21,6 +21,8 @@ the dependency surface to the standard library.
 |---|---|
 | `BuildContainer(docs, signatures, opts) ([]byte, error)` | Assemble a new `.asice` from 1..N documents + 1..N XAdES signatures. |
 | `AddSignature(container, newSignature) ([]byte, error)` | Add a parallel (co-) signature to an existing `.asice`; derives the next `signatures*.xml` index itself. |
+| `AddDocuments(container, docs) ([]byte, error)` | Complete a fileless (hash-signed) container by inserting the data objects; verifies filename and digest before inserting. |
+| `ExtractSignatures(container) ([]File, error)` | Return the `signatures*.xml` entries from a container (including a fileless one); output is suitable for `AddSignature`. |
 | `Inspect(container) (Manifest, []SignatureInfo, []DataObject, error)` | Enumerate manifest, signatures, and data objects. |
 | `CheckReferences(docs, signatures) error` | Verify signatures reference exactly the supplied documents (count + filename + SHA-2 digest). |
 
