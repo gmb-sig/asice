@@ -1,5 +1,11 @@
 # asice
 
+---
+
+**Deprecated: moved to github.com/gmb-lib/go-asice. Update imports to the new path.**
+
+---
+
 A small, framework-agnostic Go library for assembling and inspecting **ASiC-E**
 (`.asice`) containers that hold **XAdES** signatures, per
 [ETSI EN 319 162-1](https://www.etsi.org/deliver/etsi_en/319100_319199/31916201/01.01.00_30/en_31916201v010100v.pdf)
